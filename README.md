@@ -3,7 +3,7 @@
 An interactive flocking simulation: thousands of starlings wheel over a mirror lake
 through a full day/night cycle, rendered on a single HTML canvas with no dependencies.
 
-**[Live demo →](https://murmuration.netlify.app)**
+**[Live demo →](https://a-living-sky.netlify.app)**
 
 ## Interactions
 
