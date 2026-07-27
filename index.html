@@ -61,6 +61,11 @@
   .sound.on { color: var(--ink); border-color: rgba(242,235,221,0.55); background: rgba(40,44,70,0.4); }
   .sound:focus-visible { outline: 2px solid rgba(242,235,221,0.7); outline-offset: 3px; }
   .faded { opacity: 0; }
+  .nogl {
+    position: fixed; inset: 0; z-index: 5; display: none;
+    align-items: center; justify-content: center; text-align: center;
+    color: var(--ink); font-family: ui-sans-serif, sans-serif; padding: 2rem;
+  }
   @media (prefers-reduced-motion: reduce) { .overlay { transition: none; } }
   @media (max-width: 640px) { .hint { display: none; } }
 </style>
@@ -75,22 +80,26 @@
 </div>
 <div class="overlay hint" id="hintEl">
   move &mdash; the flock reads you as a <b>falcon</b><br>
+  drag the water &mdash; make waves<br>
   click &mdash; scatter the sky<br>
   <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> &mdash; gather into a shape<br>
   <kbd>space</kbd> &mdash; release the flock
 </div>
+<div class="nogl" id="noglEl"><p>This piece needs WebGL2.<br>Please try a current browser.</p></div>
 
 <script>
 (() => {
   "use strict";
   const canvas = document.getElementById("sky");
-  const ctx = canvas.getContext("2d", { alpha: false });
+  const gl = canvas.getContext("webgl2", { alpha: false, antialias: true });
   const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (!gl) { document.getElementById("noglEl").style.display = "flex"; return; }
+  const floatExt = gl.getExtension("EXT_color_buffer_float") || gl.getExtension("EXT_color_buffer_half_float");
+
   let W = 0, H = 0, DPR = 1, waterY = 0;
 
-  // ---------- Sky: a full day/night cycle ----------
-  const P = [0, 0.40, 0.62, 0.80, 0.92, 1.0];      // fixed gradient stop positions
-  const K = { // keyframe palettes (6 colors each) + star amount
+  // ---------- Day/night palette (CPU side; mirrored to shaders as uniforms) ----------
+  const K = {
     NIGHT:    { c: [[8,10,24],[12,14,32],[20,20,44],[30,26,54],[44,34,60],[60,44,66]], s: 1.0 },
     DAWN:     { c: [[26,30,66],[70,58,104],[150,96,120],[224,140,130],[244,180,150],[252,214,180]], s: 0.28 },
     DAY:      { c: [[40,92,172],[74,132,206],[120,170,224],[176,206,236],[212,230,244],[236,244,250]], s: 0.0 },
@@ -99,7 +108,7 @@
     TWILIGHT: { c: [[10,12,30],[22,22,48],[52,40,72],[96,58,78],[140,80,84],[180,110,96]], s: 0.7 },
   };
   const SCHED = [ [0.00,"NIGHT"], [0.15,"DAWN"], [0.32,"DAY"], [0.55,"GOLDEN"], [0.70,"DUSK"], [0.85,"TWILIGHT"], [1.00,"NIGHT"] ];
-  const curStops = [[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]];
+  const stopsFlat = new Float32Array(18);
   let curStar = 0;
   function computeSky(c) {
     c = ((c % 1) + 1) % 1;
@@ -107,93 +116,366 @@
     for (let i = 1; i < SCHED.length; i++) { if (c <= SCHED[i][0]) { a = SCHED[i-1]; b = SCHED[i]; break; } }
     const f = (c - a[0]) / (b[0] - a[0]);
     const A = K[a[1]], B = K[b[1]];
-    for (let i = 0; i < 6; i++) {
-      curStops[i][0] = A.c[i][0] + (B.c[i][0] - A.c[i][0]) * f;
-      curStops[i][1] = A.c[i][1] + (B.c[i][1] - A.c[i][1]) * f;
-      curStops[i][2] = A.c[i][2] + (B.c[i][2] - A.c[i][2]) * f;
-    }
+    for (let i = 0; i < 6; i++) for (let k = 0; k < 3; k++)
+      stopsFlat[i*3+k] = A.c[i][k] + (B.c[i][k] - A.c[i][k]) * f;
     curStar = A.s + (B.s - A.s) * f;
   }
-  function sampleSky(t) { // vertical fraction -> [r,g,b]
+  const SP = [0, 0.40, 0.62, 0.80, 0.92, 1.0];
+  function sampleSky(t) {
     t = t < 0 ? 0 : t > 1 ? 1 : t;
     for (let i = 1; i < 6; i++) {
-      if (t <= P[i]) {
-        const f = (t - P[i-1]) / (P[i] - P[i-1]);
-        const a = curStops[i-1], b = curStops[i];
-        return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f];
+      if (t <= SP[i]) {
+        const f = (t - SP[i-1]) / (SP[i] - SP[i-1]);
+        return [stopsFlat[(i-1)*3]+(stopsFlat[i*3]-stopsFlat[(i-1)*3])*f,
+                stopsFlat[(i-1)*3+1]+(stopsFlat[i*3+1]-stopsFlat[(i-1)*3+1])*f,
+                stopsFlat[(i-1)*3+2]+(stopsFlat[i*3+2]-stopsFlat[(i-1)*3+2])*f];
       }
     }
-    return curStops[5];
-  }
-  let lumLUT = new Float32Array(1);
-  function refreshLum() {
-    if (lumLUT.length !== H) lumLUT = new Float32Array(H);
-    for (let y = 0; y < H; y++) {
-      const c = sampleSky(y / H);
-      lumLUT[y] = (0.2126*c[0] + 0.7152*c[1] + 0.0722*c[2]) / 255;
-    }
+    return [stopsFlat[15], stopsFlat[16], stopsFlat[17]];
   }
 
-  // stars
-  let stars = [];
-  function makeStars() {
-    stars = [];
-    const n = Math.round((W * H) / 9000);
-    for (let i = 0; i < n; i++) {
-      stars.push({ x: Math.random()*W, y: Math.random()*waterY*0.9, r: Math.random()*1.1+0.3,
-                   b: 0.3+Math.random()*0.7, ph: Math.random()*Math.PI*2, sp: 0.001+Math.random()*0.003 });
-    }
+  // ---------- GL helpers ----------
+  function mkShader(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      console.error("shader error:", gl.getShaderInfoLog(s), "\n--- source ---\n" + src);
+    return s;
   }
+  function mkProg(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, mkShader(gl.VERTEX_SHADER, vs));
+    gl.attachShader(p, mkShader(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error("link error:", gl.getProgramInfoLog(p));
+    return p;
+  }
+  const U = (p, n) => gl.getUniformLocation(p, n);
 
-  let lastW = 0, lastH = 0;
-  function resize() {
-    DPR = Math.min(window.devicePixelRatio || 1, 2);
-    const rect = canvas.getBoundingClientRect();
-    let w = Math.round(rect.width), h = Math.round(rect.height);
-    if (w < 10) w = window.innerWidth || 1280;   // layout not ready yet -> fall back
-    if (h < 10) h = window.innerHeight || 720;
-    W = Math.max(2, w); H = Math.max(2, h);
-    waterY = Math.round(H * 0.80);
-    canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    makeStars();
-    if (N > 0 && lastW > 0 && (W !== lastW || H !== lastH)) {   // keep the flock spread on resize
-      const rx = W / lastW, ry = H / lastH;
-      for (let i = 0; i < N; i++) { px[i] *= rx; py[i] = Math.min(py[i] * ry, waterY - 8); }
+  const SKY_FN = `
+  uniform vec3 uStops[6];
+  const float SPP[6] = float[6](0.0,0.40,0.62,0.80,0.92,1.0);
+  vec3 skyCol(float t){
+    t = clamp(t, 0.0, 1.0);
+    vec3 c = uStops[5];
+    for (int i = 1; i < 6; i++) {
+      if (t <= SPP[i]) { c = mix(uStops[i-1], uStops[i], (t-SPP[i-1])/(SPP[i]-SPP[i-1])); break; }
     }
-    lastW = W; lastH = H;
+    return c / 255.0;
   }
+  float hash21(vec2 p){ p = fract(p*vec2(123.34,456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+  `;
+
+  const QUAD_VS = `#version 300 es
+  layout(location=0) in vec2 aPos;
+  out vec2 vUV;
+  void main(){ vUV = aPos; gl_Position = vec4(aPos*2.0-1.0, 0.0, 1.0); }`;
+
+  // ---------- Sky shader (gradient + stars + sun/moon with halo) ----------
+  const SKY_FS = `#version 300 es
+  precision highp float;
+  in vec2 vUV; out vec4 outC;
+  uniform vec2 uRes; uniform float uTime, uStar, uWaterY;
+  uniform vec3 uBodyCol; uniform vec4 uBody; // x,y,r,alt
+  uniform float uIsSun;
+  ${SKY_FN}
+  void main(){
+    float yPix = (1.0 - vUV.y) * uRes.y;         // screen y (down)
+    float xPix = vUV.x * uRes.x;
+    float t = yPix / uRes.y;
+    vec3 col = skyCol(t);
+    // stars
+    if (uStar > 0.01 && yPix < uWaterY*0.92) {
+      vec2 cell = floor(vec2(xPix, yPix)/26.0);
+      float h = hash21(cell);
+      if (h > 0.90) {
+        vec2 sp = vec2(hash21(cell+7.1), hash21(cell+3.7))*26.0 + cell*26.0;
+        float d = length(vec2(xPix,yPix)-sp);
+        float tw = 0.6 + 0.4*sin(uTime*(1.0+h*2.0)*2.0 + h*40.0);
+        float fade = 1.0 - yPix/(uWaterY*0.92);
+        col += vec3(1.0,0.98,0.93) * smoothstep(1.6,0.2,d) * uStar * tw * fade * (0.35+0.65*h);
+      }
+    }
+    // sun / moon
+    if (uBody.w > -0.05) {
+      float d = distance(vec2(xPix,yPix), uBody.xy);
+      float halo = exp(-d / (min(uRes.x,uRes.y)*0.30)) * 0.30 * max(0.15, uBody.w);
+      col += uBodyCol * halo;
+      float disc = smoothstep(uBody.z+1.5, uBody.z-1.5, d);
+      vec3 body = uBodyCol;
+      if (uIsSun < 0.5) {  // crescent shading
+        float d2 = distance(vec2(xPix,yPix), uBody.xy + vec2(uBody.z*0.42, -uBody.z*0.28));
+        float sh = smoothstep(uBody.z*0.92+1.5, uBody.z*0.92-1.5, d2);
+        body = mix(body, skyCol(uBody.y/uRes.y), sh*0.85);
+      }
+      col = mix(col, body, disc);
+    }
+    outC = vec4(col, 1.0);
+  }`;
+
+  // ---------- Bird shader (instanced, flat-shaded 3D, flap + bank, plastic specular) ----------
+  const BIRD_VS = `#version 300 es
+  layout(location=0) in vec3 aPos;
+  layout(location=1) in vec3 aNorm;
+  layout(location=2) in float aWing;    // signed flap weight
+  layout(location=3) in vec4 aI0;       // x, y, depth z (0 far..1 near), heading
+  layout(location=4) in vec3 aI1;       // bank, flapPhase, size(px)
+  uniform vec2 uRes; uniform float uReflect, uWaterY, uSquash;
+  out vec3 vN; out vec2 vScr; out float vZ;
+  void main(){
+    float flap = sin(aI1.y) * 0.85;
+    vec3 p = aPos, n = aNorm;
+    float a = flap * aWing;              // wings
+    float ca = cos(a), sa = sin(a);
+    p.yz = mat2(ca,-sa,sa,ca) * p.yz;  n.yz = mat2(ca,-sa,sa,ca) * n.yz;
+    float b = aI1.x;                     // bank
+    float cb = cos(b), sb = sin(b);
+    p.yz = mat2(cb,-sb,sb,cb) * p.yz;  n.yz = mat2(cb,-sb,sb,cb) * n.yz;
+    float th = aI0.w;                    // heading (screen space, y down)
+    float ch = cos(th), sh = sin(th);
+    p.xy = mat2(ch,-sh,sh,ch) * p.xy;  n.xy = mat2(ch,-sh,sh,ch) * n.xy;
+    vec2 xy = aI0.xy + p.xy * aI1.z;
+    if (uReflect > 0.5) xy.y = uWaterY + (uWaterY - xy.y) * uSquash;
+    vec2 ndc = vec2(xy.x/uRes.x*2.0-1.0, 1.0 - xy.y/uRes.y*2.0);
+    gl_Position = vec4(ndc, mix(0.8, -0.8, aI0.z), 1.0);
+    vN = n; vScr = xy; vZ = aI0.z;
+  }`;
+
+  const BIRD_FS = `#version 300 es
+  precision highp float;
+  in vec3 vN; in vec2 vScr; in float vZ; out vec4 outC;
+  uniform vec2 uRes; uniform vec3 uLightPos, uLightCol; uniform float uLightI, uReflect;
+  ${SKY_FN}
+  void main(){
+    vec3 n = normalize(vN);
+    if (!gl_FrontFacing) n = -n;
+    vec3 L = normalize(vec3(uLightPos.xy - vScr, uLightPos.z));
+    vec3 V = vec3(0.0, 0.0, 1.0);
+    vec3 Hv = normalize(L + V);
+    vec3 behind = skyCol(vScr.y / uRes.y);
+    float lum = dot(behind, vec3(0.2126, 0.7152, 0.0722));
+    float tt = smoothstep(0.06, 0.34, lum);
+    vec3 alb = mix(vec3(0.95, 0.92, 0.86), vec3(0.09, 0.08, 0.12), tt);  // pale in dark sky, dark vs bright sky
+    float diff = max(dot(n, L), 0.0);
+    float spec = pow(max(dot(n, Hv), 0.0), 42.0) * 1.15;
+    vec3 irid = mix(vec3(0.55, 0.95, 0.80), vec3(0.90, 0.65, 1.05), clamp(0.5 + 0.7*n.x, 0.0, 1.0));
+    vec3 amb = mix(behind, vec3(0.5 + lum), 0.55) * 0.85 + 0.10;
+    vec3 col = alb * (amb + uLightCol * diff * uLightI * 0.8) + irid * spec * uLightI;
+    col = mix(col, behind, (1.0 - vZ) * 0.30);      // atmospheric haze on far birds
+    float alpha = mix(0.7, 1.0, vZ);
+    if (uReflect > 0.5) { col *= vec3(0.50, 0.58, 0.74); alpha *= 0.55; }
+    outC = vec4(col, alpha);
+  }`;
+
+  // ---------- Shadow shader (soft blobs on the water) ----------
+  const SHADOW_VS = `#version 300 es
+  layout(location=0) in vec2 aPos;      // unit quad 0..1
+  layout(location=3) in vec4 aI0;
+  layout(location=4) in vec3 aI1;
+  uniform vec2 uRes; uniform float uWaterY, uSquash; uniform vec3 uLightPos;
+  out vec2 vQ; out float vA;
+  void main(){
+    float alt = clamp((uWaterY - aI0.y) / (uWaterY*0.55), 0.0, 1.0);
+    float sy = uWaterY + (uWaterY - aI0.y) * uSquash;
+    float sx = aI0.x + (aI0.x - uLightPos.x) * 0.05 * (1.0 - alt);
+    float w = aI1.z * 4.2, h = aI1.z * 1.3;
+    vec2 xy = vec2(sx, sy) + (aPos - 0.5) * vec2(w, h);
+    vec2 ndc = vec2(xy.x/uRes.x*2.0-1.0, 1.0 - xy.y/uRes.y*2.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    vQ = aPos; vA = (1.0 - alt);
+    if (sy < uWaterY + 2.0) vA = 0.0;
+  }`;
+  const SHADOW_FS = `#version 300 es
+  precision highp float;
+  in vec2 vQ; in float vA; out vec4 outC;
+  void main(){
+    float d = length(vQ - 0.5);
+    float a = smoothstep(0.5, 0.12, d) * vA * vA * 0.34;
+    outC = vec4(vec3(0.01, 0.02, 0.05), a);
+  }`;
+
+  // ---------- Water sim (wave equation, ping-pong) ----------
+  const SIM_FS = `#version 300 es
+  precision highp float;
+  in vec2 vUV; out vec4 outC;
+  uniform sampler2D uPrev; uniform vec2 uSimRes;
+  uniform vec4 uDrops[8];   // x, y (uv), radius, strength
+  void main(){
+    ivec2 ij = ivec2(gl_FragCoord.xy);
+    ivec2 mx = ivec2(uSimRes) - 1;
+    vec2 c = texelFetch(uPrev, ij, 0).rg;             // r = h, g = h_prev
+    float l = texelFetch(uPrev, clamp(ij+ivec2(-1,0), ivec2(0), mx), 0).r;
+    float r = texelFetch(uPrev, clamp(ij+ivec2( 1,0), ivec2(0), mx), 0).r;
+    float u = texelFetch(uPrev, clamp(ij+ivec2(0,-1), ivec2(0), mx), 0).r;
+    float d = texelFetch(uPrev, clamp(ij+ivec2(0, 1), ivec2(0), mx), 0).r;
+    float lap = l + r + u + d - 4.0*c.r;
+    float vel = (c.r - c.g) * 0.996 + lap * 0.44;
+    float hn = c.r + vel;
+    vec2 uv = gl_FragCoord.xy / uSimRes;
+    for (int i = 0; i < 8; i++) {
+      if (uDrops[i].w != 0.0) {
+        float dd = length((uv - uDrops[i].xy) * vec2(uSimRes.x/uSimRes.y, 1.0));
+        hn += uDrops[i].w * exp(-dd*dd / (uDrops[i].z*uDrops[i].z));
+      }
+    }
+    hn *= 0.9985;
+    outC = vec4(hn, c.r, 0.0, 1.0);
+  }`;
+
+  // ---------- Water render (waves, Fresnel, reflections, glitter) ----------
+  const WATER_FS = `#version 300 es
+  precision highp float;
+  in vec2 vUV; out vec4 outC;
+  uniform vec2 uRes; uniform float uTime, uWaterY, uSquash, uHasSim;
+  uniform sampler2D uSim, uRefl;
+  uniform vec2 uSimRes;
+  uniform vec3 uBodyCol; uniform vec4 uBody; uniform float uLightI;
+  ${SKY_FN}
+  void main(){
+    float lake = uRes.y - uWaterY;
+    float t = vUV.y;                                  // 0 horizon .. 1 near
+    float xPix = vUV.x * uRes.x;
+    float yPix = uWaterY + t * lake;
+    // --- wave field: sim + procedural wind waves (foreshortened) ---
+    float persp = mix(3.2, 1.0, t);
+    vec2 su = vec2(vUV.x, t);
+    float hx = 0.0, hy = 0.0, hC = 0.0;
+    if (uHasSim > 0.5) {
+      vec2 e = 1.0 / uSimRes;
+      hC = texture(uSim, su).r;
+      hx = texture(uSim, su + vec2(e.x,0)).r - texture(uSim, su - vec2(e.x,0)).r;
+      hy = texture(uSim, su + vec2(0,e.y)).r - texture(uSim, su - vec2(0,e.y)).r;
+    }
+    float k1 = 90.0*persp, k2 = 41.0*persp, k3 = 150.0*persp;
+    float px1 = cos(vUV.x*k1 + uTime*1.5 + t*8.0)  * 0.018;
+    float px2 = cos(vUV.x*k2 - uTime*0.9 + t*24.0) * 0.030;
+    float py1 = cos(t*60.0 + uTime*1.1 + vUV.x*30.0) * 0.020;
+    float px3 = cos(vUV.x*k3 + uTime*2.3) * 0.008;
+    float nx = hx*2.2 + px1 + px2 + px3;
+    float ny = hy*2.2 + py1;
+    vec3 n = normalize(vec3(-nx*2.4, 1.0, -ny*2.4)); // water-plane normal, y up
+    // --- reflections ---
+    float mirY = uWaterY - (yPix - uWaterY) / uSquash;
+    float distAmp = (14.0 + 90.0*t);
+    vec2 reflUV = vec2((xPix + nx*distAmp) / uRes.x, 1.0 - (yPix + ny*distAmp*0.6) / uRes.y);
+    vec4 birds = texture(uRefl, reflUV);
+    vec3 skyR = skyCol(clamp(mirY/uRes.y + ny*0.9, 0.0, 1.0));
+    // reflected sun/moon
+    if (uBody.w > -0.05) {
+      float bMirY = uWaterY + (uWaterY - uBody.y) * uSquash;
+      vec2 dv = vec2(xPix - uBody.x, yPix - bMirY);
+      float halo = exp(-length(dv) / (min(uRes.x,uRes.y)*0.22)) * 0.26 * max(0.12, uBody.w);
+      skyR += uBodyCol * halo;
+    }
+    vec3 refl = mix(skyR, birds.rgb, birds.a * 0.85);
+    // --- composition: Fresnel toward horizon, deep water near viewer ---
+    vec3 horizonC = skyCol(0.985);
+    vec3 deep = mix(vec3(0.03, 0.05, 0.095) + horizonC*0.16, refl*0.38, 0.40);
+    float fres = pow(1.0 - t, 1.1)*0.62 + 0.30;
+    vec3 col = mix(deep, refl, fres);
+    // wave shading (3D light on the surface)
+    vec3 Lw = normalize(vec3((uBody.x/uRes.x - vUV.x)*0.8, max(uBody.w, 0.08)*1.4, 0.55));
+    float diff = max(dot(n, Lw), 0.0);
+    col *= 0.78 + 0.42*diff;
+    // sun/moon glitter path from wave normals
+    vec3 Vw = normalize(vec3(0.0, 0.62, 0.79));
+    vec3 Hw = normalize(Lw + Vw);
+    float spec = pow(max(dot(n, Hw), 0.0), 140.0) * uLightI * 2.2;
+    float path = exp(-abs(xPix - uBody.x) / (uRes.x*(0.055 + 0.10*t)));
+    col += uBodyCol * spec * (0.25 + 1.6*path) * step(-0.04, uBody.w);
+    // sim swell brightening (crests catch light)
+    col += uBodyCol * clamp(hC, 0.0, 1.0) * 0.10 * uLightI;
+    // shoreline sheen
+    col += horizonC * smoothstep(0.008, 0.0, t) * 0.22;
+    outC = vec4(col, 1.0);
+  }`;
+
+  // water quad vertex: maps 0..1 into the lake strip
+  const WATER_VS = `#version 300 es
+  layout(location=0) in vec2 aPos;
+  uniform vec2 uRes; uniform float uWaterY;
+  out vec2 vUV;
+  void main(){
+    vUV = aPos;
+    float yTopN = 1.0 - uWaterY/uRes.y*2.0;
+    float y = mix(yTopN, -1.0, aPos.y);
+    gl_Position = vec4(aPos.x*2.0-1.0, y, 0.0, 1.0);
+  }`;
+
+  const progSky = mkProg(QUAD_VS, SKY_FS);
+  const progBird = mkProg(BIRD_VS, BIRD_FS);
+  const progShadow = mkProg(SHADOW_VS, SHADOW_FS);
+  const progSim = mkProg(QUAD_VS, SIM_FS);
+  const progWater = mkProg(WATER_VS, WATER_FS);
+
+  // ---------- Geometry ----------
+  const quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0, 1,0, 0,1, 1,0, 1,1, 0,1]), gl.STATIC_DRAW);
+
+  // low-poly bird: faceted body + two wings, flat normals
+  function buildBirdMesh() {
+    const out = [];
+    function tri(a, b, c, wa, wb, wc) {
+      const ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+      const vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+      let nx = uy*vz-uz*vy, ny = uz*vx-ux*vz, nz = ux*vy-uy*vx;
+      const l = Math.hypot(nx,ny,nz) || 1; nx/=l; ny/=l; nz/=l;
+      for (const [p, w] of [[a,wa],[b,wb],[c,wc]]) out.push(p[0],p[1],p[2], nx,ny,nz, w);
+    }
+    const N = [1.55,0,0.02], T = [-1.15,0,0.20], Uu = [0.05,0,0.30], D = [0.15,0,-0.26],
+          L = [0.05,-0.24,0.02], R = [0.05,0.24,0.02];
+    tri(N,Uu,R,0,0,0); tri(N,R,D,0,0,0); tri(N,D,L,0,0,0); tri(N,L,Uu,0,0,0);
+    tri(T,R,Uu,0,0,0); tri(T,D,R,0,0,0); tri(T,L,D,0,0,0); tri(T,Uu,L,0,0,0);
+    // right wing (+y), swept back, flap weight grows toward tip
+    const rl = [0.42,0.18,0.06], rt = [-0.30,0.24,0.02], tl = [0.02,1.48,0.10], tt = [-0.62,1.34,0.06];
+    tri(rl,tl,tt, 0.15,1,1); tri(rl,tt,rt, 0.15,1,0.15);
+    // left wing (mirror y, negative weight)
+    const m = v => [v[0], -v[1], v[2]];
+    tri(m(rl),m(tt),m(tl), -0.15,-1,-1); tri(m(rl),m(rt),m(tt), -0.15,-0.15,-1);
+    return new Float32Array(out);
+  }
+  const birdMesh = buildBirdMesh();
+  const birdVerts = birdMesh.length / 7;
+  const meshBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, birdMesh, gl.STATIC_DRAW);
 
   // ---------- Boids ----------
   let N = 0;
-  let px, py, vx, vy, pz, tx, ty;
+  let px, py, vx, vy, pz, tx, ty, bank, th0, flap;
+  let instData, instBuf = gl.createBuffer();
   function initBoids() {
-    N = Math.max(900, Math.min(2400, Math.round((W * H) / 620)));
+    N = Math.max(800, Math.min(2200, Math.round((W * H) / 700)));
     px = new Float32Array(N); py = new Float32Array(N);
     vx = new Float32Array(N); vy = new Float32Array(N);
     pz = new Float32Array(N); tx = new Float32Array(N); ty = new Float32Array(N);
-    // spread across the sky, with a gentle rising drift for a soft "release"
+    bank = new Float32Array(N); th0 = new Float32Array(N); flap = new Float32Array(N);
     for (let i = 0; i < N; i++) {
       px[i] = Math.random()*W;
       py[i] = waterY * (0.12 + Math.random()*0.62);
       const a = Math.random()*Math.PI*2, sp = 1.6 + Math.random();
       vx[i] = Math.cos(a)*sp; vy[i] = Math.sin(a)*sp - 0.8;
       pz[i] = Math.random(); tx[i] = px[i]; ty[i] = py[i];
+      flap[i] = Math.random()*Math.PI*2;
     }
+    instData = new Float32Array(N * 7);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, instData.byteLength, gl.DYNAMIC_DRAW);
   }
 
   const CELL = 40;
-  let cols = 1, rows = 1, heads, next;
+  let cols = 1, rows = 1, heads, nxt;
   function rebuildGrid() {
     cols = Math.max(1, Math.ceil(W / CELL)); rows = Math.max(1, Math.ceil(H / CELL));
     if (!heads || heads.length !== cols*rows) heads = new Int32Array(cols*rows);
     heads.fill(-1);
-    if (!next || next.length !== N) next = new Int32Array(N);
+    if (!nxt || nxt.length !== N) nxt = new Int32Array(N);
     for (let i = 0; i < N; i++) {
       let cx = (px[i]/CELL)|0, cy = (py[i]/CELL)|0;
       if (cx < 0) cx = 0; else if (cx >= cols) cx = cols-1;
       if (cy < 0) cy = 0; else if (cy >= rows) cy = rows-1;
-      const c = cy*cols + cx; next[i] = heads[c]; heads[c] = i;
+      const c = cy*cols + cx; nxt[i] = heads[c]; heads[c] = i;
     }
   }
 
@@ -205,7 +487,7 @@
     drawFn(g, w, h);
     const data = g.getImageData(0,0,w,h).data, pts = [], md = Math.max(w,h);
     for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
-      if (data[(y*w+x)*4+3] > 128) pts.push([(x - w/2)/md, (y - h/2)/md]);   // normalize by max dim -> aspect preserved
+      if (data[(y*w+x)*4+3] > 128) pts.push([(x - w/2)/md, (y - h/2)/md]);
     }
     if (!pts.length) return null;
     const out = new Float32Array(count*2);
@@ -226,7 +508,7 @@
       if (tw > w*0.95) { fs = Math.round(fs * (w*0.95)/tw); g.font = "900 "+fs+"px ui-sans-serif, Arial, sans-serif"; }
       g.fillText("AMAZE", w/2, h/2); },
   };
-  let formMix = 0, formTarget = 0, formName = "";
+  let formMix = 0, formTarget = 0;
   function gather(kind) {
     const src = SHAPES[kind]; if (!src) return;
     let w = 240, h = 240, scale = Math.min(W, waterY) * 0.62, jit = 5;
@@ -237,17 +519,111 @@
       tx[i] = cx + pts[i*2] * scale + (Math.random()-0.5)*jit;
       ty[i] = cy + pts[i*2+1] * scale + (Math.random()-0.5)*jit;
     }
-    formTarget = 1; formName = kind; fade();
+    formTarget = 1; fade();
     audio && audio.swell();
   }
   function release() { formTarget = 0; }
 
+  // ---------- Water sim state ----------
+  const SIMW = 384, SIMH = 96;
+  let simTexA, simTexB, simFBA, simFBB, simPing = true, hasSim = false;
+  function mkSimTex() {
+    const t = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RG16F, SIMW, SIMH, 0, gl.RG, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  function mkFB(tex) {
+    const f = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return ok ? f : null;
+  }
+  if (floatExt) {
+    simTexA = mkSimTex(); simTexB = mkSimTex();
+    simFBA = mkFB(simTexA); simFBB = mkFB(simTexB);
+    hasSim = !!(simFBA && simFBB);
+  }
+  const drops = [];   // pending: {x, y (sim uv), r, s}
+  function addDrop(x, y, r, s) { if (drops.length < 8) drops.push([x, y, r, s]); }
+  const dropUniform = new Float32Array(32);
+
+  // reflection FBO
+  let reflTex = null, reflFB = null, reflW = 0, reflH = 0;
+  function ensureRefl() {
+    const w = Math.max(2, (W*DPR/2)|0), h = Math.max(2, (H*DPR/2)|0);
+    if (w === reflW && h === reflH) return;
+    reflW = w; reflH = h;
+    if (reflTex) { gl.deleteTexture(reflTex); gl.deleteFramebuffer(reflFB); }
+    reflTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, reflTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    reflFB = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, reflFB);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, reflTex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+  const blackTex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, blackTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0,0,0,0]));
+
+  // ---------- Resize ----------
+  let lastW = 0, lastH = 0;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    const rect = canvas.getBoundingClientRect();
+    let w = Math.round(rect.width), h = Math.round(rect.height);
+    if (w < 10) w = window.innerWidth || 1280;
+    if (h < 10) h = window.innerHeight || 720;
+    W = Math.max(2, w); H = Math.max(2, h);
+    waterY = Math.round(H * 0.80);
+    canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
+    if (N > 0 && lastW > 0 && (W !== lastW || H !== lastH)) {
+      const rx = W / lastW, ry = H / lastH;
+      for (let i = 0; i < N; i++) { px[i] *= rx; py[i] = Math.min(py[i] * ry, waterY - 8); }
+    }
+    lastW = W; lastH = H;
+    ensureRefl();
+  }
+
   // ---------- Input ----------
   const mouse = { x: -9999, y: -9999, active: false };
   let scatter = 0;
-  canvas.addEventListener("pointermove", e => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.active = true; fade(); });
+  let lastWakeX = -1, lastWakeY = -1;
+  function waterUV(x, y) { return [x / W, (y - waterY) / (H - waterY)]; }
+  canvas.addEventListener("pointermove", e => {
+    mouse.x = e.clientX; mouse.y = e.clientY; mouse.active = true; fade();
+    if (e.clientY > waterY) {
+      const dx = e.clientX - lastWakeX, dy = e.clientY - lastWakeY;
+      if (dx*dx + dy*dy > 36) {
+        const [ux, uy] = waterUV(e.clientX, e.clientY);
+        addDrop(ux, uy, 0.016, 0.35);
+        lastWakeX = e.clientX; lastWakeY = e.clientY;
+      }
+    }
+  });
   canvas.addEventListener("pointerleave", () => mouse.active = false);
-  canvas.addEventListener("pointerdown", e => { mouse.x = e.clientX; mouse.y = e.clientY; scatter = 1; fade(); audio && audio.whoosh(); });
+  canvas.addEventListener("pointerdown", e => {
+    mouse.x = e.clientX; mouse.y = e.clientY; fade();
+    if (e.clientY > waterY) {
+      const [ux, uy] = waterUV(e.clientX, e.clientY);
+      addDrop(ux, uy, 0.030, 2.4);
+      audio && audio.whoosh();
+    } else {
+      scatter = 1;
+      audio && audio.whoosh();
+    }
+  });
   window.addEventListener("keydown", e => {
     if (e.code === "Space") { e.preventDefault(); release(); }
     else if (e.key === "1") gather("heart");
@@ -281,7 +657,6 @@
       const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null;
       const ac = new AC();
       const master = ac.createGain(); master.gain.value = 0.0; master.connect(ac.destination);
-      // wind: filtered noise
       const buf = ac.createBuffer(1, ac.sampleRate*2, ac.sampleRate);
       const d = buf.getChannelData(0); let last = 0;
       for (let i = 0; i < d.length; i++) { const wn = Math.random()*2-1; last = (last + 0.02*wn)/1.02; d[i] = last*3.2; }
@@ -331,9 +706,10 @@
   // ---------- Simulation ----------
   const PERC2 = 36*36, SEP2 = 13*13, MAXV = 3.6, MINV = 1.9;
   let roostY = 0;
-  const CYCLE = 84000; // ms per full day
-  let cycleC = 0.62;   // start near golden hour
+  const CYCLE = 84000;
+  let cycleC = 0.62;
   let startT = 0;
+  let lastAmbient = 0;
 
   function step(t) {
     if (!startT) startT = t;
@@ -344,6 +720,10 @@
     const forming = formMix > 0.004;
     const predR = 165, predR2 = predR*predR;
     const waterCeil = waterY - 26;
+    if (t - lastAmbient > 2600) {   // occasional ambient raindrop on the lake
+      lastAmbient = t;
+      if (Math.random() < 0.7) addDrop(Math.random(), 0.15 + Math.random()*0.8, 0.012, 0.5);
+    }
 
     for (let i = 0; i < N; i++) {
       const x = px[i], y = py[i];
@@ -357,9 +737,8 @@
             const dx=px[j]-x, dy=py[j]-y, d2=dx*dx+dy*dy;
             if (d2 < PERC2) { ax+=vx[j]; ay+=vy[j]; cxs+=px[j]; cys+=py[j]; cn++; count++;
               if (d2 < SEP2 && d2 > 0.0001) { const inv=1/d2; sx-=dx*inv; sy-=dy*inv; } } }
-            j = next[j]; } } }
+            j = nxt[j]; } } }
 
-      // free-flight forces
       let ffx=0, ffy=0;
       if (count>0){ ffx += (ax/count)*0.065; ffy += (ay/count)*0.065; }
       if (cn>0){ ffx += ((cxs/cn)-x)*0.0022; ffy += ((cys/cn)-y)*0.0022; }
@@ -367,21 +746,18 @@
       ffy += (roostY - y) * 0.0009;
       ffx += Math.sin((y + t*0.00013)*0.011) * 0.04;
 
-      // formation forces
       let gfx=0, gfy=0;
       if (forming) { gfx = (tx[i]-x)*0.020 + sx*7; gfy = (ty[i]-y)*0.020 + sy*7; }
 
       let fx = ffx + (gfx-ffx)*formMix;
       let fy = ffy + (gfy-ffy)*formMix;
 
-      // predator + scatter (always)
       if (mouse.active) { const dx=x-mouse.x, dy=y-mouse.y, d2=dx*dx+dy*dy;
         if (d2<predR2 && d2>0.01){ const d=Math.sqrt(d2), f=1-d/predR, push=f*f*4.0*(0.6+pz[i]*0.8);
           fx += (dx/d)*push; fy += (dy/d)*push; } }
       if (scatter>0.01){ const dx=x-mouse.x, dy=y-mouse.y, d=Math.sqrt(dx*dx+dy*dy)+0.01, f=scatter*4.6*Math.exp(-d/280);
         fx += (dx/d)*f; fy += (dy/d)*f; }
 
-      // keep above the lake / below the top
       if (y > waterCeil) fy -= (y - waterCeil)*0.02;
       if (y < 14) fy += (14 - y)*0.02;
 
@@ -390,112 +766,188 @@
       const maxv = forming ? (MAXV - 1.0*formMix) : MAXV;
       if (sp>maxv){ const k=maxv/sp; vx[i]*=k; vy[i]*=k; }
       else if (sp<MINV && !forming){ const k=MINV/(sp||1); vx[i]*=k; vy[i]*=k; }
-      if (forming) { const dmp = 1 - 0.13*formMix; vx[i]*=dmp; vy[i]*=dmp; }  // settle onto the shape
+      if (forming) { const dmp = 1 - 0.13*formMix; vx[i]*=dmp; vy[i]*=dmp; }
 
-      let nx=x+vx[i], ny=y+vy[i];
-      if (nx<-20) nx=W+20; else if (nx>W+20) nx=-20;
-      if (ny<8) ny=8; else if (ny>waterCeil+4) ny=waterCeil+4;
-      px[i]=nx; py[i]=ny;
+      let nx2=x+vx[i], ny2=y+vy[i];
+      if (nx2<-20) nx2=W+20; else if (nx2>W+20) nx2=-20;
+      if (ny2<8) ny2=8; else if (ny2>waterCeil+4) ny2=waterCeil+4;
+      px[i]=nx2; py[i]=ny2;
+
+      // orientation dynamics for the 3D render
+      const th = Math.atan2(vy[i], vx[i]);
+      let dth = th - th0[i];
+      if (dth > Math.PI) dth -= Math.PI*2; else if (dth < -Math.PI) dth += Math.PI*2;
+      bank[i] += (Math.max(-1.1, Math.min(1.1, dth*9)) - bank[i]) * 0.14;
+      th0[i] = th;
+      flap[i] += 0.20 + sp*0.045 - formMix*0.10;
     }
     if (scatter>0) scatter *= 0.9;
   }
 
-  // ---------- Render ----------
-  const DARK=[20,18,30], LIGHT=[236,228,214];
-  function draw(t) {
-    computeSky(cycleC);
-    refreshLum();
-
-    // sky gradient
-    const g = ctx.createLinearGradient(0,0,0,H);
-    for (let i=0;i<6;i++){ const c=curStops[i]; g.addColorStop(P[i], `rgb(${c[0]|0},${c[1]|0},${c[2]|0})`); }
-    ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
-
-    // stars
-    if (curStar > 0.01) {
-      for (let i=0;i<stars.length;i++){ const s=stars[i];
-        const tw = 0.6 + 0.4*Math.sin(t*s.sp + s.ph);
-        ctx.fillStyle = `rgba(255,250,238,${(curStar*s.b*tw).toFixed(3)})`;
-        ctx.fillRect(s.x, s.y, s.r, s.r); }
+  function packInstances() {
+    for (let i = 0; i < N; i++) {
+      const o = i*7;
+      instData[o] = px[i]; instData[o+1] = py[i]; instData[o+2] = pz[i]; instData[o+3] = th0[i];
+      instData[o+4] = bank[i]; instData[o+5] = flap[i];
+      instData[o+6] = (1.6 + pz[i]*3.4) * (1 - 0.42*formMix);
     }
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, instData);
+  }
 
-    // celestial body (sun by day, moon by night)
-    const sunAlt = Math.cos((((cycleC%1)+1)%1 - 0.40)*Math.PI*2);
-    const moonAlt = Math.cos((((cycleC%1)+1)%1 - 0.90)*Math.PI*2);
+  // ---------- Attribute binding helpers ----------
+  function bindQuad(loc) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    gl.vertexAttribDivisor(loc, 0);
+  }
+  function bindBirdAttrs() {
+    gl.bindBuffer(gl.ARRAY_BUFFER, meshBuf);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);  gl.vertexAttribDivisor(0, 0);
+    gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 28, 12); gl.vertexAttribDivisor(1, 0);
+    gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 28, 24); gl.vertexAttribDivisor(2, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 28, 0);  gl.vertexAttribDivisor(3, 1);
+    gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 3, gl.FLOAT, false, 28, 16); gl.vertexAttribDivisor(4, 1);
+  }
+  function disableAttrs() { for (let i = 0; i < 5; i++) { gl.disableVertexAttribArray(i); gl.vertexAttribDivisor(i, 0); } }
+
+  // ---------- Render ----------
+  function celestial() {
+    const c = ((cycleC%1)+1)%1;
+    const sunAlt = Math.cos((c - 0.40)*Math.PI*2);
+    const moonAlt = Math.cos((c - 0.90)*Math.PI*2);
     const isSun = sunAlt >= moonAlt;
     const alt = Math.max(sunAlt, moonAlt);
-    let bodyX = 0, bodyY = 0, bodyVisible = alt > -0.05;
-    const arcH = H*0.66;
-    if (isSun) { const prog=((((cycleC%1)+1)%1)-0.15)/0.5; bodyX = (prog<0?prog+2:prog)*W; }
-    else { const prog=(((((cycleC%1)+1)%1)-0.65+1)%1)/0.5; bodyX = prog*W; }
-    bodyY = waterY - Math.max(0,alt)*arcH;
-    const bodyR = Math.min(W,H)*0.045;
-    const bodyCol = isSun ? [255,238,196] : [214,222,240];
-    if (bodyVisible) {
-      const rg = ctx.createRadialGradient(bodyX,bodyY,0, bodyX,bodyY, Math.min(W,H)*0.55*(0.4+0.6*Math.max(0,alt)));
-      rg.addColorStop(0, `rgba(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]},${(0.28*Math.max(0.15,alt)).toFixed(3)})`);
-      rg.addColorStop(0.3, `rgba(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]},0.07)`);
-      rg.addColorStop(1, "rgba(0,0,0,0)");
-      ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
-      ctx.beginPath(); ctx.arc(bodyX,bodyY,bodyR,0,Math.PI*2);
-      ctx.fillStyle = `rgb(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]})`; ctx.fill();
-      if (!isSun) { // moon shading
-        ctx.beginPath(); ctx.arc(bodyX+bodyR*0.42,bodyY-bodyR*0.28,bodyR*0.92,0,Math.PI*2);
-        const sc = sampleSky(bodyY/H); ctx.fillStyle = `rgba(${sc[0]|0},${sc[1]|0},${sc[2]|0},0.85)`; ctx.fill();
+    let bx;
+    if (isSun) { const prog=(c-0.15)/0.5; bx = (prog<0?prog+2:prog)*W; }
+    else { const prog=((c-0.65+1)%1)/0.5; bx = prog*W; }
+    const by = waterY - Math.max(0,alt)*(H*0.66);
+    const br = Math.min(W,H)*0.045;
+    const col = isSun ? [1.0,0.933,0.769] : [0.839,0.871,0.941];
+    return { bx, by, br, alt, isSun, col };
+  }
+
+  function draw(t) {
+    const ts = t * 0.001;
+    computeSky(cycleC);
+    const cel = celestial();
+    const lightI = 0.55 + 0.65*Math.max(0, cel.alt);
+    packInstances();
+
+    // --- 1. water sim update ---
+    if (hasSim && !reduced) {
+      dropUniform.fill(0);
+      for (let i = 0; i < drops.length; i++) {
+        dropUniform[i*4] = drops[i][0]; dropUniform[i*4+1] = drops[i][1];
+        dropUniform[i*4+2] = drops[i][2]; dropUniform[i*4+3] = drops[i][3];
       }
+      drops.length = 0;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, simPing ? simFBB : simFBA);
+      gl.viewport(0, 0, SIMW, SIMH);
+      gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+      gl.useProgram(progSim);
+      bindQuad(0);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, simPing ? simTexA : simTexB);
+      gl.uniform1i(U(progSim,"uPrev"), 0);
+      gl.uniform2f(U(progSim,"uSimRes"), SIMW, SIMH);
+      gl.uniform4fv(U(progSim,"uDrops"), dropUniform);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      simPing = !simPing;
     }
 
-    // birds (above the lake)
-    for (let i=0;i<N;i++){
-      const z=pz[i], x=px[i], y=py[i], ang=Math.atan2(vy[i],vx[i]), size=(1.7+z*3.0)*(1-0.42*formMix);
-      const yi = y<0?0:(y>=H?H-1:y|0), lum=lumLUT[yi];
-      const tt = Math.max(0, Math.min(1, (lum-0.12)/0.5));
-      const r=LIGHT[0]+(DARK[0]-LIGHT[0])*tt, gr=LIGHT[1]+(DARK[1]-LIGHT[1])*tt, b=LIGHT[2]+(DARK[2]-LIGHT[2])*tt;
-      const alpha=Math.min(1,(0.45+z*0.5)*(0.8+0.2*Math.abs(tt-0.5)*2));
-      ctx.fillStyle = `rgba(${r|0},${gr|0},${b|0},${alpha.toFixed(3)})`;
-      ctx.save(); ctx.translate(x,y); ctx.rotate(ang);
-      ctx.beginPath(); ctx.moveTo(size,0); ctx.lineTo(-size,size*0.72); ctx.lineTo(-size*0.35,0); ctx.lineTo(-size,-size*0.72); ctx.closePath(); ctx.fill();
-      ctx.restore();
-    }
+    // --- 2. reflection pass (mirrored birds into half-res FBO) ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, reflFB);
+    gl.viewport(0, 0, reflW, reflH);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(progBird);
+    bindBirdAttrs();
+    gl.uniform2f(U(progBird,"uRes"), W, H);
+    gl.uniform1f(U(progBird,"uReflect"), 1);
+    gl.uniform1f(U(progBird,"uWaterY"), waterY);
+    gl.uniform1f(U(progBird,"uSquash"), 0.30);
+    gl.uniform3fv(U(progBird,"uStops"), stopsFlat);
+    gl.uniform3f(U(progBird,"uLightPos"), cel.bx, cel.by, 640);
+    gl.uniform3f(U(progBird,"uLightCol"), cel.col[0], cel.col[1], cel.col[2]);
+    gl.uniform1f(U(progBird,"uLightI"), lightI);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, birdVerts, N);
 
-    // ---- water ----
-    const horiz = sampleSky(0.995), mid = sampleSky(0.82);
-    const wg = ctx.createLinearGradient(0,waterY,0,H);
-    wg.addColorStop(0, `rgb(${(horiz[0]*0.72)|0},${(horiz[1]*0.72)|0},${(horiz[2]*0.78+14)|0})`);
-    wg.addColorStop(0.5, `rgb(${(mid[0]*0.5)|0},${(mid[1]*0.5)|0},${(mid[2]*0.6+16)|0})`);
-    wg.addColorStop(1, `rgb(${(mid[0]*0.28)|0},${(mid[1]*0.28)|0},${(mid[2]*0.4+18)|0})`);
-    ctx.fillStyle = wg; ctx.fillRect(0,waterY,W,H-waterY);
+    // --- 3. main pass ---
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, W*DPR, H*DPR);
+    gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
 
-    // reflected birds (band just above waterline)
-    const lake = H - waterY;
-    for (let i=0;i<N;i++){
-      const y=py[i]; if (y>=waterY) continue;
-      const ry = 2*waterY - y; if (ry>H) continue;
-      const depth=(ry-waterY)/lake;
-      const a=(1-depth)*0.42; if (a<0.03) continue;
-      const ripple=Math.sin(ry*0.06 + t*0.004)*(1.5+depth*7);
-      const z=pz[i], size=1.6+z*2.6, ang=-Math.atan2(vy[i],vx[i]);
-      ctx.fillStyle=`rgba(40,52,86,${a.toFixed(3)})`;
-      ctx.save(); ctx.translate(px[i]+ripple, ry); ctx.rotate(ang);
-      ctx.beginPath(); ctx.moveTo(size,0); ctx.lineTo(-size,size*0.7); ctx.lineTo(-size*0.35,0); ctx.lineTo(-size,-size*0.7); ctx.closePath(); ctx.fill();
-      ctx.restore();
-    }
+    // sky
+    gl.useProgram(progSky);
+    disableAttrs(); bindQuad(0);
+    gl.uniform2f(U(progSky,"uRes"), W, H);
+    gl.uniform1f(U(progSky,"uTime"), ts);
+    gl.uniform1f(U(progSky,"uStar"), curStar);
+    gl.uniform1f(U(progSky,"uWaterY"), waterY);
+    gl.uniform3fv(U(progSky,"uStops"), stopsFlat);
+    gl.uniform4f(U(progSky,"uBody"), cel.bx, cel.by, cel.br, cel.alt);
+    gl.uniform3f(U(progSky,"uBodyCol"), cel.col[0], cel.col[1], cel.col[2]);
+    gl.uniform1f(U(progSky,"uIsSun"), cel.isSun ? 1 : 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-    // sun/moon glitter column on the water
-    if (bodyVisible && bodyY < waterY) {
-      const gx = bodyX;
-      for (let k=0;k<18;k++){ const yy=waterY + (k/18)*lake; const dd=k/18;
-        const flick=0.4+0.6*Math.abs(Math.sin(t*0.003 + k*1.7 + gx*0.01));
-        const w=(Math.min(W,H)*0.05)*(0.4+dd*1.6)*flick;
-        const a=(1-dd)*0.16*flick;
-        ctx.fillStyle=`rgba(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]},${a.toFixed(3)})`;
-        ctx.fillRect(gx - w/2, yy, w, 1.6);
-      }
-    }
-    // shoreline sheen
-    const sh = sampleSky(0.985);
-    ctx.fillStyle = `rgba(${sh[0]|0},${sh[1]|0},${sh[2]|0},0.35)`;
-    ctx.fillRect(0, waterY-1, W, 2);
+    // water
+    gl.useProgram(progWater);
+    disableAttrs(); bindQuad(0);
+    gl.uniform2f(U(progWater,"uRes"), W, H);
+    gl.uniform1f(U(progWater,"uTime"), ts);
+    gl.uniform1f(U(progWater,"uWaterY"), waterY);
+    gl.uniform1f(U(progWater,"uSquash"), 0.30);
+    gl.uniform1f(U(progWater,"uHasSim"), hasSim ? 1 : 0);
+    gl.uniform3fv(U(progWater,"uStops"), stopsFlat);
+    gl.uniform4f(U(progWater,"uBody"), cel.bx, cel.by, cel.br, cel.alt);
+    gl.uniform3f(U(progWater,"uBodyCol"), cel.col[0], cel.col[1], cel.col[2]);
+    gl.uniform1f(U(progWater,"uLightI"), lightI);
+    gl.uniform2f(U(progWater,"uSimRes"), SIMW, SIMH);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, hasSim ? (simPing ? simTexA : simTexB) : blackTex);
+    gl.uniform1i(U(progWater,"uSim"), 0);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, reflTex);
+    gl.uniform1i(U(progWater,"uRefl"), 1);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // bird shadows on the water
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(progShadow);
+    disableAttrs();
+    bindQuad(0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, instBuf);
+    gl.enableVertexAttribArray(3); gl.vertexAttribPointer(3, 4, gl.FLOAT, false, 28, 0);  gl.vertexAttribDivisor(3, 1);
+    gl.enableVertexAttribArray(4); gl.vertexAttribPointer(4, 3, gl.FLOAT, false, 28, 16); gl.vertexAttribDivisor(4, 1);
+    gl.uniform2f(U(progShadow,"uRes"), W, H);
+    gl.uniform1f(U(progShadow,"uWaterY"), waterY);
+    gl.uniform1f(U(progShadow,"uSquash"), 0.30);
+    gl.uniform3f(U(progShadow,"uLightPos"), cel.bx, cel.by, 640);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, N);
+
+    // birds
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthFunc(gl.LEQUAL);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(progBird);
+    disableAttrs(); bindBirdAttrs();
+    gl.uniform2f(U(progBird,"uRes"), W, H);
+    gl.uniform1f(U(progBird,"uReflect"), 0);
+    gl.uniform1f(U(progBird,"uWaterY"), waterY);
+    gl.uniform1f(U(progBird,"uSquash"), 0.30);
+    gl.uniform3fv(U(progBird,"uStops"), stopsFlat);
+    gl.uniform3f(U(progBird,"uLightPos"), cel.bx, cel.by, 640);
+    gl.uniform3f(U(progBird,"uLightCol"), cel.col[0], cel.col[1], cel.col[2]);
+    gl.uniform1f(U(progBird,"uLightI"), lightI);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, birdVerts, N);
+    gl.disable(gl.DEPTH_TEST);
 
     // HUD
     const ph = phaseName(cycleC);
@@ -503,12 +955,21 @@
   }
 
   let raf;
-  function loop(t){ step(t||0); draw(t||0); raf = requestAnimationFrame(loop); }
+  function loop(t) { step(t || 0); draw(t || 0); raf = requestAnimationFrame(loop); }
 
   window.addEventListener("resize", () => { resize(); if (N === 0) initBoids(); });
   if (window.ResizeObserver) new ResizeObserver(() => { resize(); if (N === 0) initBoids(); }).observe(canvas);
   resize(); initBoids();
-  if (reduced) { computeSky(cycleC); refreshLum(); rebuildGrid(); draw(0); } else loop(0);
+
+  // minimal debug hooks (used for automated visual testing)
+  window.murmur = {
+    tick(n) { const b = performance.now(); for (let k = 0; k < n; k++) step(b + k*16); draw(b + n*16); },
+    gather, release,
+    stats() { let mx=0,my=0; for(let i=0;i<N;i++){mx+=px[i];my+=py[i];}
+      return { N, W, H, waterY, formMix: +formMix.toFixed(2), meanx: (mx/N)|0, meany: (my/N)|0, hasSim }; },
+  };
+
+  if (reduced) { computeSky(cycleC); draw(0); } else loop(0);
 })();
 </script>
 </body>
