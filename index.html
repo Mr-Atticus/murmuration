@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Murmuration</title>
+<style>
+  :root { --ink: #f2ebdd; --ink-dim: rgba(242, 235, 221, 0.5); }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #0b0e1c; }
+  #sky { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+
+  .overlay {
+    position: fixed; z-index: 2; color: var(--ink);
+    font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+    user-select: none; pointer-events: none;
+    transition: opacity 1.8s ease;
+    text-shadow: 0 1px 22px rgba(0,0,0,0.55);
+  }
+  .title { left: clamp(20px, 4vw, 56px); bottom: clamp(20px, 4vh, 48px); }
+  .title h1 {
+    font-family: ui-serif, Georgia, "Times New Roman", serif;
+    font-weight: 300; font-size: clamp(1.9rem, 5.2vw, 3.6rem);
+    letter-spacing: 0.12em; line-height: 1;
+  }
+  .title p {
+    margin-top: 0.7em; font-size: 0.72rem; letter-spacing: 0.3em;
+    text-transform: uppercase; color: var(--ink-dim);
+  }
+  .hint {
+    right: clamp(20px, 4vw, 56px); bottom: clamp(20px, 4vh, 48px);
+    text-align: right; font-size: 0.72rem; letter-spacing: 0.13em;
+    color: var(--ink-dim); line-height: 2.05;
+  }
+  .hint b { color: var(--ink); font-weight: 500; }
+  .hint kbd {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.68rem; color: var(--ink);
+    border: 1px solid rgba(242,235,221,0.3); border-radius: 4px;
+    padding: 1px 5px; letter-spacing: 0;
+  }
+  .hud {
+    left: 50%; top: clamp(16px, 3.4vh, 36px); transform: translateX(-50%);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.66rem; letter-spacing: 0.32em; color: var(--ink-dim);
+    text-transform: uppercase; white-space: nowrap;
+  }
+  .hud b { color: var(--ink); font-weight: 400; }
+  .sound {
+    position: fixed; z-index: 3; top: clamp(14px, 3vh, 32px); right: clamp(18px, 4vw, 52px);
+    pointer-events: auto; cursor: pointer;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.64rem; letter-spacing: 0.22em; text-transform: uppercase;
+    color: var(--ink-dim); background: rgba(20,22,40,0.28);
+    border: 1px solid rgba(242,235,221,0.22); border-radius: 999px;
+    padding: 6px 13px; backdrop-filter: blur(6px);
+    transition: color .3s ease, border-color .3s ease, background .3s ease;
+    text-shadow: 0 1px 14px rgba(0,0,0,0.5);
+  }
+  .sound:hover { color: var(--ink); border-color: rgba(242,235,221,0.5); }
+  .sound.on { color: var(--ink); border-color: rgba(242,235,221,0.55); background: rgba(40,44,70,0.4); }
+  .sound:focus-visible { outline: 2px solid rgba(242,235,221,0.7); outline-offset: 3px; }
+  .faded { opacity: 0; }
+  @media (prefers-reduced-motion: reduce) { .overlay { transition: none; } }
+  @media (max-width: 640px) { .hint { display: none; } }
+</style>
+</head>
+<body>
+<canvas id="sky"></canvas>
+<button class="sound" id="soundBtn" aria-pressed="false">♪ sound off</button>
+<div class="overlay hud" id="hudEl"></div>
+<div class="overlay title" id="titleEl">
+  <h1>Murmuration</h1>
+  <p>a living sky</p>
+</div>
+<div class="overlay hint" id="hintEl">
+  move &mdash; the flock reads you as a <b>falcon</b><br>
+  click &mdash; scatter the sky<br>
+  <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd> &mdash; gather into a shape<br>
+  <kbd>space</kbd> &mdash; release the flock
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const canvas = document.getElementById("sky");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  let W = 0, H = 0, DPR = 1, waterY = 0;
+
+  // ---------- Sky: a full day/night cycle ----------
+  const P = [0, 0.40, 0.62, 0.80, 0.92, 1.0];      // fixed gradient stop positions
+  const K = { // keyframe palettes (6 colors each) + star amount
+    NIGHT:    { c: [[8,10,24],[12,14,32],[20,20,44],[30,26,54],[44,34,60],[60,44,66]], s: 1.0 },
+    DAWN:     { c: [[26,30,66],[70,58,104],[150,96,120],[224,140,130],[244,180,150],[252,214,180]], s: 0.28 },
+    DAY:      { c: [[40,92,172],[74,132,206],[120,170,224],[176,206,236],[212,230,244],[236,244,250]], s: 0.0 },
+    GOLDEN:   { c: [[38,44,92],[92,80,120],[190,120,96],[236,158,92],[248,192,120],[252,222,164]], s: 0.05 },
+    DUSK:     { c: [[16,20,40],[34,32,62],[110,72,84],[176,96,74],[222,140,84],[248,206,150]], s: 0.22 },
+    TWILIGHT: { c: [[10,12,30],[22,22,48],[52,40,72],[96,58,78],[140,80,84],[180,110,96]], s: 0.7 },
+  };
+  const SCHED = [ [0.00,"NIGHT"], [0.15,"DAWN"], [0.32,"DAY"], [0.55,"GOLDEN"], [0.70,"DUSK"], [0.85,"TWILIGHT"], [1.00,"NIGHT"] ];
+  const curStops = [[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0],[0,0,0]];
+  let curStar = 0;
+  function computeSky(c) {
+    c = ((c % 1) + 1) % 1;
+    let a = SCHED[0], b = SCHED[1];
+    for (let i = 1; i < SCHED.length; i++) { if (c <= SCHED[i][0]) { a = SCHED[i-1]; b = SCHED[i]; break; } }
+    const f = (c - a[0]) / (b[0] - a[0]);
+    const A = K[a[1]], B = K[b[1]];
+    for (let i = 0; i < 6; i++) {
+      curStops[i][0] = A.c[i][0] + (B.c[i][0] - A.c[i][0]) * f;
+      curStops[i][1] = A.c[i][1] + (B.c[i][1] - A.c[i][1]) * f;
+      curStops[i][2] = A.c[i][2] + (B.c[i][2] - A.c[i][2]) * f;
+    }
+    curStar = A.s + (B.s - A.s) * f;
+  }
+  function sampleSky(t) { // vertical fraction -> [r,g,b]
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    for (let i = 1; i < 6; i++) {
+      if (t <= P[i]) {
+        const f = (t - P[i-1]) / (P[i] - P[i-1]);
+        const a = curStops[i-1], b = curStops[i];
+        return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f];
+      }
+    }
+    return curStops[5];
+  }
+  let lumLUT = new Float32Array(1);
+  function refreshLum() {
+    if (lumLUT.length !== H) lumLUT = new Float32Array(H);
+    for (let y = 0; y < H; y++) {
+      const c = sampleSky(y / H);
+      lumLUT[y] = (0.2126*c[0] + 0.7152*c[1] + 0.0722*c[2]) / 255;
+    }
+  }
+
+  // stars
+  let stars = [];
+  function makeStars() {
+    stars = [];
+    const n = Math.round((W * H) / 9000);
+    for (let i = 0; i < n; i++) {
+      stars.push({ x: Math.random()*W, y: Math.random()*waterY*0.9, r: Math.random()*1.1+0.3,
+                   b: 0.3+Math.random()*0.7, ph: Math.random()*Math.PI*2, sp: 0.001+Math.random()*0.003 });
+    }
+  }
+
+  let lastW = 0, lastH = 0;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    const rect = canvas.getBoundingClientRect();
+    let w = Math.round(rect.width), h = Math.round(rect.height);
+    if (w < 10) w = window.innerWidth || 1280;   // layout not ready yet -> fall back
+    if (h < 10) h = window.innerHeight || 720;
+    W = Math.max(2, w); H = Math.max(2, h);
+    waterY = Math.round(H * 0.80);
+    canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    makeStars();
+    if (N > 0 && lastW > 0 && (W !== lastW || H !== lastH)) {   // keep the flock spread on resize
+      const rx = W / lastW, ry = H / lastH;
+      for (let i = 0; i < N; i++) { px[i] *= rx; py[i] = Math.min(py[i] * ry, waterY - 8); }
+    }
+    lastW = W; lastH = H;
+  }
+
+  // ---------- Boids ----------
+  let N = 0;
+  let px, py, vx, vy, pz, tx, ty;
+  function initBoids() {
+    N = Math.max(900, Math.min(2400, Math.round((W * H) / 620)));
+    px = new Float32Array(N); py = new Float32Array(N);
+    vx = new Float32Array(N); vy = new Float32Array(N);
+    pz = new Float32Array(N); tx = new Float32Array(N); ty = new Float32Array(N);
+    // spread across the sky, with a gentle rising drift for a soft "release"
+    for (let i = 0; i < N; i++) {
+      px[i] = Math.random()*W;
+      py[i] = waterY * (0.12 + Math.random()*0.62);
+      const a = Math.random()*Math.PI*2, sp = 1.6 + Math.random();
+      vx[i] = Math.cos(a)*sp; vy[i] = Math.sin(a)*sp - 0.8;
+      pz[i] = Math.random(); tx[i] = px[i]; ty[i] = py[i];
+    }
+  }
+
+  const CELL = 40;
+  let cols = 1, rows = 1, heads, next;
+  function rebuildGrid() {
+    cols = Math.max(1, Math.ceil(W / CELL)); rows = Math.max(1, Math.ceil(H / CELL));
+    if (!heads || heads.length !== cols*rows) heads = new Int32Array(cols*rows);
+    heads.fill(-1);
+    if (!next || next.length !== N) next = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+      let cx = (px[i]/CELL)|0, cy = (py[i]/CELL)|0;
+      if (cx < 0) cx = 0; else if (cx >= cols) cx = cols-1;
+      if (cy < 0) cy = 0; else if (cy >= rows) cy = rows-1;
+      const c = cy*cols + cx; next[i] = heads[c]; heads[c] = i;
+    }
+  }
+
+  // ---------- Shape targets ----------
+  function rasterSample(drawFn, count, w, h) {
+    w = w || 240; h = h || 240;
+    const oc = document.createElement("canvas"); oc.width = w; oc.height = h;
+    const g = oc.getContext("2d"); g.clearRect(0,0,w,h); g.fillStyle = "#fff"; g.strokeStyle = "#fff";
+    drawFn(g, w, h);
+    const data = g.getImageData(0,0,w,h).data, pts = [], md = Math.max(w,h);
+    for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) {
+      if (data[(y*w+x)*4+3] > 128) pts.push([(x - w/2)/md, (y - h/2)/md]);   // normalize by max dim -> aspect preserved
+    }
+    if (!pts.length) return null;
+    const out = new Float32Array(count*2);
+    for (let i = 0; i < count; i++) { const p = pts[(Math.random()*pts.length)|0]; out[i*2] = p[0]; out[i*2+1] = p[1]; }
+    return out;
+  }
+  const SHAPES = {
+    heart: (g,w) => { g.translate(w/2,w*0.56); const k=w*0.026; g.beginPath();
+      for (let a=0;a<=Math.PI*2;a+=0.02){ const x=16*Math.pow(Math.sin(a),3);
+        const y=-(13*Math.cos(a)-5*Math.cos(2*a)-2*Math.cos(3*a)-Math.cos(4*a)); if(a===0)g.moveTo(x*k,y*k);else g.lineTo(x*k,y*k);} g.closePath(); g.fill(); },
+    star: (g,w) => { g.translate(w/2,w/2); const R=w*0.46, r=R*0.42; g.beginPath();
+      for (let i=0;i<10;i++){ const rad=i%2?r:R, an=-Math.PI/2 + i*Math.PI/5; const x=Math.cos(an)*rad,y=Math.sin(an)*rad; if(i===0)g.moveTo(x,y);else g.lineTo(x,y);} g.closePath(); g.fill(); },
+    spiral: (g,w) => { g.translate(w/2,w/2); g.lineWidth=w*0.05; g.lineCap="round"; g.beginPath();
+      for (let a=0;a<Math.PI*7;a+=0.08){ const rad=a*w*0.0125; const x=Math.cos(a)*rad,y=Math.sin(a)*rad; if(a===0)g.moveTo(x,y);else g.lineTo(x,y);} g.stroke(); },
+    text: (g,w,h) => { g.textAlign="center"; g.textBaseline="middle";
+      let fs = Math.round(h*0.86); g.font = "900 "+fs+"px ui-sans-serif, Arial, sans-serif";
+      const tw = g.measureText("AMAZE").width;
+      if (tw > w*0.95) { fs = Math.round(fs * (w*0.95)/tw); g.font = "900 "+fs+"px ui-sans-serif, Arial, sans-serif"; }
+      g.fillText("AMAZE", w/2, h/2); },
+  };
+  let formMix = 0, formTarget = 0, formName = "";
+  function gather(kind) {
+    const src = SHAPES[kind]; if (!src) return;
+    let w = 240, h = 240, scale = Math.min(W, waterY) * 0.62, jit = 5;
+    if (kind === "text") { w = 560, h = 220; scale = Math.min(W * 0.74, 1000); jit = 2.5; }
+    const pts = rasterSample(src, N, w, h); if (!pts) return;
+    const cx = W*0.5, cy = (kind === "text") ? waterY*0.34 : waterY*0.46;
+    for (let i = 0; i < N; i++) {
+      tx[i] = cx + pts[i*2] * scale + (Math.random()-0.5)*jit;
+      ty[i] = cy + pts[i*2+1] * scale + (Math.random()-0.5)*jit;
+    }
+    formTarget = 1; formName = kind; fade();
+    audio && audio.swell();
+  }
+  function release() { formTarget = 0; }
+
+  // ---------- Input ----------
+  const mouse = { x: -9999, y: -9999, active: false };
+  let scatter = 0;
+  canvas.addEventListener("pointermove", e => { mouse.x = e.clientX; mouse.y = e.clientY; mouse.active = true; fade(); });
+  canvas.addEventListener("pointerleave", () => mouse.active = false);
+  canvas.addEventListener("pointerdown", e => { mouse.x = e.clientX; mouse.y = e.clientY; scatter = 1; fade(); audio && audio.whoosh(); });
+  window.addEventListener("keydown", e => {
+    if (e.code === "Space") { e.preventDefault(); release(); }
+    else if (e.key === "1") gather("heart");
+    else if (e.key === "2") gather("star");
+    else if (e.key === "3") gather("spiral");
+    else if (e.key === "4") gather("text");
+  });
+
+  // ---------- Overlays ----------
+  const titleEl = document.getElementById("titleEl"), hintEl = document.getElementById("hintEl"),
+        hudEl = document.getElementById("hudEl");
+  let faded = false;
+  function fade() { if (faded) return; faded = true;
+    setTimeout(() => { titleEl.classList.add("faded"); hintEl.classList.add("faded"); }, 4200); }
+  setTimeout(fade, 8500);
+  let lastPhase = "";
+  function phaseName(c) {
+    c = ((c%1)+1)%1;
+    if (c < 0.10 || c >= 0.93) return "night";
+    if (c < 0.22) return "dawn";
+    if (c < 0.50) return "day";
+    if (c < 0.66) return "golden hour";
+    if (c < 0.80) return "dusk";
+    return "twilight";
+  }
+
+  // ---------- Ambient audio (opt-in) ----------
+  let audio = null;
+  function buildAudio() {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return null;
+      const ac = new AC();
+      const master = ac.createGain(); master.gain.value = 0.0; master.connect(ac.destination);
+      // wind: filtered noise
+      const buf = ac.createBuffer(1, ac.sampleRate*2, ac.sampleRate);
+      const d = buf.getChannelData(0); let last = 0;
+      for (let i = 0; i < d.length; i++) { const wn = Math.random()*2-1; last = (last + 0.02*wn)/1.02; d[i] = last*3.2; }
+      const src = ac.createBufferSource(); src.buffer = buf; src.loop = true;
+      const lp = ac.createBiquadFilter(); lp.type = "lowpass"; lp.frequency.value = 480;
+      const windGain = ac.createGain(); windGain.gain.value = 0.35;
+      src.connect(lp); lp.connect(windGain); windGain.connect(master); src.start();
+      let lfo = 0;
+      const tick = () => { lfo += 0.006; windGain.gain.value = 0.22 + 0.16*Math.sin(lfo); if (audio && audio.on) requestAnimationFrame(tick); };
+      const call = (freq, when, dur, vol) => {
+        const o = ac.createOscillator(), g = ac.createGain();
+        o.type = "sine"; o.frequency.setValueAtTime(freq, when);
+        o.frequency.linearRampToValueAtTime(freq*1.04, when+dur*0.5);
+        g.gain.setValueAtTime(0, when); g.gain.linearRampToValueAtTime(vol, when+0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, when+dur);
+        o.connect(g); g.connect(master); o.start(when); o.stop(when+dur+0.05);
+      };
+      let nextCall = 0;
+      const scale = [523.25, 587.33, 698.46, 783.99, 880.0, 1046.5];
+      const sched = () => {
+        if (!audio || !audio.on) return;
+        const now = ac.currentTime;
+        if (now > nextCall) { const f = scale[(Math.random()*scale.length)|0]*(Math.random()<0.3?0.5:1);
+          call(f, now+0.02, 0.5+Math.random()*0.7, 0.05+Math.random()*0.05); nextCall = now + 1.2 + Math.random()*3.2; }
+        setTimeout(sched, 200);
+      };
+      return {
+        on: false, ac, master,
+        enable() { this.on = true; ac.resume(); master.gain.cancelScheduledValues(ac.currentTime);
+          master.gain.setValueAtTime(master.gain.value, ac.currentTime); master.gain.linearRampToValueAtTime(0.9, ac.currentTime+1.2);
+          tick(); sched(); },
+        disable() { this.on = false; master.gain.linearRampToValueAtTime(0.0, ac.currentTime+0.6); },
+        swell() { if (this.on) { windGain.gain.setValueAtTime(windGain.gain.value, ac.currentTime); windGain.gain.linearRampToValueAtTime(0.5, ac.currentTime+0.3); } },
+        whoosh() { if (!this.on) return; const now = ac.currentTime;
+          for (let i=0;i<5;i++) call(scale[(Math.random()*scale.length)|0], now+i*0.03, 0.3, 0.04); },
+      };
+    } catch (e) { return null; }
+  }
+  const soundBtn = document.getElementById("soundBtn");
+  soundBtn.addEventListener("click", () => {
+    if (!audio) audio = buildAudio();
+    if (!audio) { soundBtn.textContent = "♪ n/a"; return; }
+    if (audio.on) { audio.disable(); soundBtn.textContent = "♪ sound off"; soundBtn.classList.remove("on"); soundBtn.setAttribute("aria-pressed","false"); }
+    else { audio.enable(); soundBtn.textContent = "♪ sound on"; soundBtn.classList.add("on"); soundBtn.setAttribute("aria-pressed","true"); }
+  });
+
+  // ---------- Simulation ----------
+  const PERC2 = 36*36, SEP2 = 13*13, MAXV = 3.6, MINV = 1.9;
+  let roostY = 0;
+  const CYCLE = 84000; // ms per full day
+  let cycleC = 0.62;   // start near golden hour
+  let startT = 0;
+
+  function step(t) {
+    if (!startT) startT = t;
+    cycleC = 0.62 + (t - startT) / CYCLE;
+    rebuildGrid();
+    roostY = waterY * (0.42 + 0.14 * Math.sin(t * 0.00006));
+    formMix += (formTarget - formMix) * 0.028;
+    const forming = formMix > 0.004;
+    const predR = 165, predR2 = predR*predR;
+    const waterCeil = waterY - 26;
+
+    for (let i = 0; i < N; i++) {
+      const x = px[i], y = py[i];
+      let ax=0, ay=0, cxs=0, cys=0, sx=0, sy=0, count=0, cn=0;
+      const gcx = Math.min(cols-1, Math.max(0, (x/CELL)|0));
+      const gcy = Math.min(rows-1, Math.max(0, (y/CELL)|0));
+      for (let oy=-1; oy<=1; oy++) { const ry=gcy+oy; if (ry<0||ry>=rows) continue; const base=ry*cols;
+        for (let ox=-1; ox<=1; ox++) { const rx=gcx+ox; if (rx<0||rx>=cols) continue;
+          let j = heads[base+rx];
+          while (j !== -1) { if (j !== i) {
+            const dx=px[j]-x, dy=py[j]-y, d2=dx*dx+dy*dy;
+            if (d2 < PERC2) { ax+=vx[j]; ay+=vy[j]; cxs+=px[j]; cys+=py[j]; cn++; count++;
+              if (d2 < SEP2 && d2 > 0.0001) { const inv=1/d2; sx-=dx*inv; sy-=dy*inv; } } }
+            j = next[j]; } } }
+
+      // free-flight forces
+      let ffx=0, ffy=0;
+      if (count>0){ ffx += (ax/count)*0.065; ffy += (ay/count)*0.065; }
+      if (cn>0){ ffx += ((cxs/cn)-x)*0.0022; ffy += ((cys/cn)-y)*0.0022; }
+      ffx += sx*24; ffy += sy*24;
+      ffy += (roostY - y) * 0.0009;
+      ffx += Math.sin((y + t*0.00013)*0.011) * 0.04;
+
+      // formation forces
+      let gfx=0, gfy=0;
+      if (forming) { gfx = (tx[i]-x)*0.020 + sx*7; gfy = (ty[i]-y)*0.020 + sy*7; }
+
+      let fx = ffx + (gfx-ffx)*formMix;
+      let fy = ffy + (gfy-ffy)*formMix;
+
+      // predator + scatter (always)
+      if (mouse.active) { const dx=x-mouse.x, dy=y-mouse.y, d2=dx*dx+dy*dy;
+        if (d2<predR2 && d2>0.01){ const d=Math.sqrt(d2), f=1-d/predR, push=f*f*4.0*(0.6+pz[i]*0.8);
+          fx += (dx/d)*push; fy += (dy/d)*push; } }
+      if (scatter>0.01){ const dx=x-mouse.x, dy=y-mouse.y, d=Math.sqrt(dx*dx+dy*dy)+0.01, f=scatter*4.6*Math.exp(-d/280);
+        fx += (dx/d)*f; fy += (dy/d)*f; }
+
+      // keep above the lake / below the top
+      if (y > waterCeil) fy -= (y - waterCeil)*0.02;
+      if (y < 14) fy += (14 - y)*0.02;
+
+      vx[i]+=fx; vy[i]+=fy;
+      const sp = Math.hypot(vx[i], vy[i]);
+      const maxv = forming ? (MAXV - 1.0*formMix) : MAXV;
+      if (sp>maxv){ const k=maxv/sp; vx[i]*=k; vy[i]*=k; }
+      else if (sp<MINV && !forming){ const k=MINV/(sp||1); vx[i]*=k; vy[i]*=k; }
+      if (forming) { const dmp = 1 - 0.13*formMix; vx[i]*=dmp; vy[i]*=dmp; }  // settle onto the shape
+
+      let nx=x+vx[i], ny=y+vy[i];
+      if (nx<-20) nx=W+20; else if (nx>W+20) nx=-20;
+      if (ny<8) ny=8; else if (ny>waterCeil+4) ny=waterCeil+4;
+      px[i]=nx; py[i]=ny;
+    }
+    if (scatter>0) scatter *= 0.9;
+  }
+
+  // ---------- Render ----------
+  const DARK=[20,18,30], LIGHT=[236,228,214];
+  function draw(t) {
+    computeSky(cycleC);
+    refreshLum();
+
+    // sky gradient
+    const g = ctx.createLinearGradient(0,0,0,H);
+    for (let i=0;i<6;i++){ const c=curStops[i]; g.addColorStop(P[i], `rgb(${c[0]|0},${c[1]|0},${c[2]|0})`); }
+    ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+    // stars
+    if (curStar > 0.01) {
+      for (let i=0;i<stars.length;i++){ const s=stars[i];
+        const tw = 0.6 + 0.4*Math.sin(t*s.sp + s.ph);
+        ctx.fillStyle = `rgba(255,250,238,${(curStar*s.b*tw).toFixed(3)})`;
+        ctx.fillRect(s.x, s.y, s.r, s.r); }
+    }
+
+    // celestial body (sun by day, moon by night)
+    const sunAlt = Math.cos((((cycleC%1)+1)%1 - 0.40)*Math.PI*2);
+    const moonAlt = Math.cos((((cycleC%1)+1)%1 - 0.90)*Math.PI*2);
+    const isSun = sunAlt >= moonAlt;
+    const alt = Math.max(sunAlt, moonAlt);
+    let bodyX = 0, bodyY = 0, bodyVisible = alt > -0.05;
+    const arcH = H*0.66;
+    if (isSun) { const prog=((((cycleC%1)+1)%1)-0.15)/0.5; bodyX = (prog<0?prog+2:prog)*W; }
+    else { const prog=(((((cycleC%1)+1)%1)-0.65+1)%1)/0.5; bodyX = prog*W; }
+    bodyY = waterY - Math.max(0,alt)*arcH;
+    const bodyR = Math.min(W,H)*0.045;
+    const bodyCol = isSun ? [255,238,196] : [214,222,240];
+    if (bodyVisible) {
+      const rg = ctx.createRadialGradient(bodyX,bodyY,0, bodyX,bodyY, Math.min(W,H)*0.55*(0.4+0.6*Math.max(0,alt)));
+      rg.addColorStop(0, `rgba(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]},${(0.28*Math.max(0.15,alt)).toFixed(3)})`);
+      rg.addColorStop(0.3, `rgba(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]},0.07)`);
+      rg.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = rg; ctx.fillRect(0,0,W,H);
+      ctx.beginPath(); ctx.arc(bodyX,bodyY,bodyR,0,Math.PI*2);
+      ctx.fillStyle = `rgb(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]})`; ctx.fill();
+      if (!isSun) { // moon shading
+        ctx.beginPath(); ctx.arc(bodyX+bodyR*0.42,bodyY-bodyR*0.28,bodyR*0.92,0,Math.PI*2);
+        const sc = sampleSky(bodyY/H); ctx.fillStyle = `rgba(${sc[0]|0},${sc[1]|0},${sc[2]|0},0.85)`; ctx.fill();
+      }
+    }
+
+    // birds (above the lake)
+    for (let i=0;i<N;i++){
+      const z=pz[i], x=px[i], y=py[i], ang=Math.atan2(vy[i],vx[i]), size=(1.7+z*3.0)*(1-0.42*formMix);
+      const yi = y<0?0:(y>=H?H-1:y|0), lum=lumLUT[yi];
+      const tt = Math.max(0, Math.min(1, (lum-0.12)/0.5));
+      const r=LIGHT[0]+(DARK[0]-LIGHT[0])*tt, gr=LIGHT[1]+(DARK[1]-LIGHT[1])*tt, b=LIGHT[2]+(DARK[2]-LIGHT[2])*tt;
+      const alpha=Math.min(1,(0.45+z*0.5)*(0.8+0.2*Math.abs(tt-0.5)*2));
+      ctx.fillStyle = `rgba(${r|0},${gr|0},${b|0},${alpha.toFixed(3)})`;
+      ctx.save(); ctx.translate(x,y); ctx.rotate(ang);
+      ctx.beginPath(); ctx.moveTo(size,0); ctx.lineTo(-size,size*0.72); ctx.lineTo(-size*0.35,0); ctx.lineTo(-size,-size*0.72); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // ---- water ----
+    const horiz = sampleSky(0.995), mid = sampleSky(0.82);
+    const wg = ctx.createLinearGradient(0,waterY,0,H);
+    wg.addColorStop(0, `rgb(${(horiz[0]*0.72)|0},${(horiz[1]*0.72)|0},${(horiz[2]*0.78+14)|0})`);
+    wg.addColorStop(0.5, `rgb(${(mid[0]*0.5)|0},${(mid[1]*0.5)|0},${(mid[2]*0.6+16)|0})`);
+    wg.addColorStop(1, `rgb(${(mid[0]*0.28)|0},${(mid[1]*0.28)|0},${(mid[2]*0.4+18)|0})`);
+    ctx.fillStyle = wg; ctx.fillRect(0,waterY,W,H-waterY);
+
+    // reflected birds (band just above waterline)
+    const lake = H - waterY;
+    for (let i=0;i<N;i++){
+      const y=py[i]; if (y>=waterY) continue;
+      const ry = 2*waterY - y; if (ry>H) continue;
+      const depth=(ry-waterY)/lake;
+      const a=(1-depth)*0.42; if (a<0.03) continue;
+      const ripple=Math.sin(ry*0.06 + t*0.004)*(1.5+depth*7);
+      const z=pz[i], size=1.6+z*2.6, ang=-Math.atan2(vy[i],vx[i]);
+      ctx.fillStyle=`rgba(40,52,86,${a.toFixed(3)})`;
+      ctx.save(); ctx.translate(px[i]+ripple, ry); ctx.rotate(ang);
+      ctx.beginPath(); ctx.moveTo(size,0); ctx.lineTo(-size,size*0.7); ctx.lineTo(-size*0.35,0); ctx.lineTo(-size,-size*0.7); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // sun/moon glitter column on the water
+    if (bodyVisible && bodyY < waterY) {
+      const gx = bodyX;
+      for (let k=0;k<18;k++){ const yy=waterY + (k/18)*lake; const dd=k/18;
+        const flick=0.4+0.6*Math.abs(Math.sin(t*0.003 + k*1.7 + gx*0.01));
+        const w=(Math.min(W,H)*0.05)*(0.4+dd*1.6)*flick;
+        const a=(1-dd)*0.16*flick;
+        ctx.fillStyle=`rgba(${bodyCol[0]},${bodyCol[1]},${bodyCol[2]},${a.toFixed(3)})`;
+        ctx.fillRect(gx - w/2, yy, w, 1.6);
+      }
+    }
+    // shoreline sheen
+    const sh = sampleSky(0.985);
+    ctx.fillStyle = `rgba(${sh[0]|0},${sh[1]|0},${sh[2]|0},0.35)`;
+    ctx.fillRect(0, waterY-1, W, 2);
+
+    // HUD
+    const ph = phaseName(cycleC);
+    if (ph !== lastPhase) { lastPhase = ph; hudEl.innerHTML = `<b>${ph}</b> &nbsp;·&nbsp; ${N.toLocaleString()} starlings`; }
+  }
+
+  let raf;
+  function loop(t){ step(t||0); draw(t||0); raf = requestAnimationFrame(loop); }
+
+  window.addEventListener("resize", () => { resize(); if (N === 0) initBoids(); });
+  if (window.ResizeObserver) new ResizeObserver(() => { resize(); if (N === 0) initBoids(); }).observe(canvas);
+  resize(); initBoids();
+  if (reduced) { computeSky(cycleC); refreshLum(); rebuildGrid(); draw(0); } else loop(0);
+})();
+</script>
+</body>
+</html>
